@@ -1,4 +1,4 @@
-# 🧬 Mini AlphaEvolve v0.4
+# 🧬 Mini AlphaEvolve v0.5
 
 **Mini AlphaEvolve v0.4** is a lightweight, interactive code evolution system built in Python and Streamlit. It enables users to evolve Python functions toward an objective using a custom evaluation function and LLM-driven mutations. This project is heavily inspired by DeepMind’s [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve/), but scoped down to run locally, simply, and transparently.
 
