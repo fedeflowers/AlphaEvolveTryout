@@ -1,16 +1,111 @@
 import streamlit as st
 import openai
+import difflib
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import textwrap
+import random
+import json
+import hashlib
 
-#alphaevolve-env\Scripts\activate.bat
+################################################################################
+# Helper utilities
+################################################################################
+
+def apply_unified_diff(original_code: str, diff_text: str) -> str:
+    """Apply a unified diff string to *original_code* and return the patched text.
+    Falls back to returning *original_code* unchanged if the diff does not apply."""
+    try:
+        patched = []
+        # difflib.restore needs a sequence with lines prefixed by '  ', '+ ', or '- '
+        # We convert the diff into a sequence of (tag, line) with difflib.ndiff
+        diff_lines = diff_text.splitlines(keepends=True)
+        # Build ndiff-style list to feed to difflib.restore
+        ndiff_like = []
+        for line in diff_lines:
+            if line.startswith("+ "):
+                ndiff_like.append("+" + line[2:])
+            elif line.startswith("- "):
+                ndiff_like.append("-" + line[2:])
+            elif line.startswith("  "):
+                ndiff_like.append(" " + line[2:])
+        if not ndiff_like:
+            raise ValueError("Empty diff")
+        restored = difflib.restore(ndiff_like, 2)  # 2 => produce final version
+        return "".join(restored)
+    except Exception:
+        return original_code  # safety – return unchanged
 
 
-st.set_page_config(page_title="Mini AlphaEvolve", layout="wide")
-st.title("🧬 Mini AlphaEvolve — Evolve Python Code with OpenAI")
+def get_objective_hash(objective: str) -> str:
+    """Generate a hash of the objective to detect changes."""
+    return hashlib.md5(objective.encode()).hexdigest()
 
-# Sidebar: API key and setup
+
+def init_db(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS population (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                gen INTEGER,
+                score REAL,
+                code TEXT,
+                objective_hash TEXT
+            )"""
+        )
+    return conn
+
+
+def save_candidate(conn, gen, score, code, objective_hash):
+    with conn:
+        conn.execute(
+            "INSERT INTO population (gen, score, code, objective_hash) VALUES (?, ?, ?, ?)",
+            (gen, score, code, objective_hash),
+        )
+
+
+def sample_inspirations(conn, objective_hash, k=3):
+    """Return up to *k* high‑scoring distinct code snippets for the current objective."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT code FROM population WHERE objective_hash = ? ORDER BY score DESC LIMIT ?",
+        (objective_hash, k),
+    )
+    rows = cur.fetchall()
+    return [row[0] for row in rows]
+
+
+def reset_db_for_objective(conn, objective_hash):
+    """Remove all entries for a given objective hash."""
+    with conn:
+        conn.execute("DELETE FROM population WHERE objective_hash = ?", (objective_hash,))
+
+################################################################################
+# Streamlit UI
+################################################################################
+
+st.set_page_config(page_title="Mini AlphaEvolve v0.4", layout="wide")
+st.title("🧬 Mini AlphaEvolve — v0.4 (shared state, objective-specific DB)")
+
+# Initialize session state for API key if not present
+if "openai_api_key" not in st.session_state:
+    st.session_state.openai_api_key = ""
+
+# Sidebar – setup
 st.sidebar.header("🔐 Setup")
-api_key = st.sidebar.text_input("OpenAI API Key", type="password")
-model = st.sidebar.selectbox("OpenAI Model", ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"])
+api_key = st.sidebar.text_input("OpenAI API Key", 
+                               type="password",
+                               value=st.session_state.openai_api_key)
+
+# Update session state when API key changes
+if api_key != st.session_state.openai_api_key:
+    st.session_state.openai_api_key = api_key
+
+model_small = st.sidebar.selectbox("Fast model", ["gpt-4o-mini", "gpt-3.5-turbo"])
+model_big = st.sidebar.selectbox("Strong model", ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"])
+strong_every = st.sidebar.number_input("Use strong model every N candidates", 1, 20, 4)
 
 if not api_key:
     st.warning("Please enter your OpenAI API key in the sidebar.")
@@ -21,134 +116,293 @@ openai.api_key = api_key
 # Main inputs
 st.subheader("📌 Define the Optimization Task")
 objective = st.text_area(
-    "Describe what you want the function to do (e.g., 'Return triple of input')",
-    value="Evolve a function solution(x) that transforms an integer x into a target value using a mix of nonlinear rules, conditionals, and randomness — similar to what real-world heuristics might look like."
+    "Describe the goal",
+    value="Evolve a function solution(x) that transforms an integer x into a target value using a mix of nonlinear rules, conditionals, and randomness — similar to what real-world heuristics might look like.",
 )
 
-eval_code = st.text_area(
-    "Write an evaluation function to score candidates.\nIt should return a score (higher = better).",
-    value="""
-def evaluate(solution_fn):
-    import math
-    import random
+# Calculate objective hash
+objective_hash = get_objective_hash(objective)
 
-    score = 0
-    test_cases = list(range(-10, 11))  # test integers from -10 to 10
+# Option to reset DB for current objective
+if "last_objective_hash" not in st.session_state:
+    st.session_state.last_objective_hash = objective_hash
 
-    def target_function(x):
-        if x < 0:
-            return int(math.sqrt(abs(x)) * 3 + 5)
-        elif x == 0:
-            return 42
-        else:
-            return int(math.log(x + 1) * 7 + x % 3)
+objective_changed = objective_hash != st.session_state.last_objective_hash
+if objective_changed:
+    st.warning("⚠️ Objective has changed since last run!")
 
-    for x in test_cases:
-        try:
-            target = target_function(x)
-            guess = solution_fn(x)
-            # Penalize large deviations
-            diff = abs(guess - target)
-            score += max(0, 10 - diff)  # soft score
-        except:
-            pass
+reset_db = st.checkbox("Reset evolution database for this objective", 
+                      value=objective_changed,
+                      help="Clear previous results and start fresh")
 
-    return score
-"""
+st.markdown("#### Quick evaluation (cheap, optional)")
+quick_eval_code = st.text_area(
+    "Return a numeric score quickly; may raise on failure. Empty = skip.",
+    value=textwrap.dedent(
+        """
+        def quick_evaluate(solution_fn):
+            import math
+            
+            # Test only 5 key cases for quick feedback
+            test_cases = [-5, -1, 0, 1, 5]
+            score = 0
+            
+            def quick_target(x):
+                if x < 0:
+                    return int(math.sqrt(abs(x)) * 3 + 5)
+                elif x == 0:
+                    return 42
+                else:
+                    return int(math.log(x + 1) * 7 + x % 3)
+            
+            try:
+                for x in test_cases:
+                    target = quick_target(x)
+                    guess = solution_fn(x)
+                    # Use same scoring as full eval
+                    diff = abs(guess - target)
+                    score += max(0, 10 - diff)
+                return score / len(test_cases)  # Normalize to 0-10 range
+            except Exception:
+                return 0
+        """
+    ),
+)
+
+st.markdown("#### Full evaluation (expensive)")
+full_eval_code = st.text_area(
+    "Must return a numeric score (higher=better)",
+    value=textwrap.dedent(
+        """
+        def evaluate(solution_fn):
+            import math
+            import random
+
+            score = 0
+            test_cases = list(range(-10, 11))  # test integers from -10 to 10
+
+            def target_function(x):
+                if x < 0:
+                    return int(math.sqrt(abs(x)) * 3 + 5)
+                elif x == 0:
+                    return 42
+                else:
+                    return int(math.log(x + 1) * 7 + x % 3)
+
+            for x in test_cases:
+                try:
+                    target = target_function(x)
+                    guess = solution_fn(x)
+                    # Penalize large deviations
+                    diff = abs(guess - target)
+                    score += max(0, 10 - diff)  # soft score
+                except:
+                    pass
+
+            return score
+                """
+    ),
 )
 
 initial_code = st.text_area(
     "Initial function to evolve (must define `def solution(x): ...`)",
-    value="""
-def solution(x):
-    # Initial stub that just returns something plausible
-    return x * 2
-"""
+    value=textwrap.dedent(
+        """
+        def solution(x):
+            return 2 * x 
+        """
+    ).strip(),
 )
 
-num_generations = st.slider("Number of generations", 1, 10, 3)
-candidates_per_gen = st.slider("Candidates per generation", 1, 5, 2)
+# Evolution hyper‑params
+col1, col2 = st.columns(2)
+num_generations = col1.slider("Generations", 1, 20, 4)
+candidates_per_gen = col1.slider("Candidates / generation", 1, 10, 4)
+population_size = col2.slider("Population size to keep", 1, 50, 10)
+inspiration_k = col2.slider("Inspirations in prompt", 0, 5, 3)
+
 run = st.button("🚀 Start Evolution")
 
-# Evolution logic
+################################################################################
+# Evolution logic (v0.4)
+################################################################################
+
+def load_eval_functions():
+    namespace = {}
+    if quick_eval_code.strip():
+        exec(quick_eval_code, {}, namespace)
+        quick_evaluate = namespace.get("quick_evaluate")
+    else:
+        quick_evaluate = None
+
+    namespace = {}
+    exec(full_eval_code, {}, namespace)
+    full_evaluate = namespace["evaluate"]
+    return quick_evaluate, full_evaluate
+
+
+def get_parent(pop):
+    """Pick a parent with probability ∝ rank (lower rank => higher prob)."""
+    if not pop:
+        return initial_code
+    weights = [1 / (i + 1) for i in range(len(pop))]  # rank‑based
+    codes = [c for _, _, c in pop]
+    return random.choices(codes, weights)[0]
+
+
 if run:
+    # Update last objective hash
+    st.session_state.last_objective_hash = objective_hash
+
+    # Prepare evaluation functions
+    quick_evaluate, full_evaluate = load_eval_functions()
+
+    # DB setup in ./alphaevolve.sqlite (persistent across runs)
+    db_path = Path("alphaevolve.sqlite")
+    conn = init_db(db_path)
+
+    # Reset DB for this objective if requested
+    if reset_db:
+        reset_db_for_objective(conn, objective_hash)
+        st.success("🗑️ Database cleared for current objective")
+
+    # Seed population with initial code
+    population = []  # list of tuples (gen, score, code)
+
+    # Evaluate initial code
+    ns = {}
+    exec(initial_code, {}, ns)
+    sol_fn = ns["solution"]
+    base_score = full_evaluate(sol_fn)
+    population.append((0, base_score, initial_code))
+    save_candidate(conn, 0, base_score, initial_code, objective_hash)
+
+    client = openai.OpenAI(api_key=api_key)
+
     st.subheader("🧬 Evolution Progress")
-    best_code = initial_code
-    namespace = {}
-    exec(eval_code, {}, namespace)
-    evaluate = namespace["evaluate"]
 
-    namespace = {}
-    exec(best_code, {}, namespace)
-    solution_fn = namespace["solution"]
-    best_score = evaluate(solution_fn)
+    for gen in range(1, num_generations + 1):
+        st.markdown(f"### Generation {gen}")
 
-    with st.spinner("Evolving..."):
-        for gen in range(num_generations):
-            st.markdown(f"### Generation {gen + 1}")
-            st.code(best_code, language="python")
-            st.write(f"**Current best score:** {best_score}")
+        parent_code = get_parent(population)
+        inspirations = sample_inspirations(conn, objective_hash, k=inspiration_k)
 
-            candidates = []
-            for _ in range(candidates_per_gen):
-                prompt = f"""
-You are an AI trying to improve a Python function based on the following objective:
+        candidates = []  # (code, score)
+        with st.spinner("Evolving generation…"):
+            for cand_idx in range(candidates_per_gen):
+                use_big = (cand_idx % strong_every == 0)
+                model = model_big if use_big else model_small
 
-**Objective**: {objective}
+                prompt_parts = [
+                    "You are AlphaEvolve‑Mini, a code evolution system. Your ONLY task is to generate Python function variations.",
+                    f"Objective:\n{objective}",
+                    "---\nCURRENT IMPLEMENTATION:\n" + parent_code,
+                ]
+                if inspirations:
+                    prompt_parts.append("---\nHIGH SCORING EXAMPLES:\n" + "\n---\n".join(inspirations))
 
-Current implementation:
-{best_code}
+                prompt_parts.append(
+                    textwrap.dedent(
+                        """
+                        RESPONSE RULES:
+                        1. Return ONLY a complete Python function definition
+                        2. Function MUST start with exactly: def solution(x):
+                        3. NO explanations, NO markdown, NO backticks
+                        4. ONLY return the function code with proper indentation
+                        
+                        Example valid response:
+                        def solution(x):
+                            return x * 3
+                        """
+                    )
+                )
 
-Your task is to suggest a better implementation of the solution function.
+                prompt = "\n\n".join(prompt_parts)
 
-IMPORTANT:
-1. Only return the Python function code starting with 'def solution(x):'
-2. Do not include any explanation, markdown formatting, or additional text
-3. The function must be named 'solution' and take a single parameter 'x'
-4. Return only valid Python code
-
-Example of correct response format:
-def solution(x):
-    return x * 3
-"""
-                client = openai.OpenAI(api_key=api_key)
-
-                response = client.chat.completions.create(
+                completion = client.chat.completions.create(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.7,
                 )
-                new_code = response.choices[0].message.content.strip()
+                raw_reply = completion.choices[0].message.content.strip()
+
+                # Clean up the response
+                lines = raw_reply.splitlines()
+                cleaned_lines = []
+                started = False
                 
-                # Clean up the code response
-                if "```python" in new_code:
-                    # Extract code from markdown code blocks
-                    new_code = new_code.split("```python")[1].split("```")[0].strip()
-                elif "```" in new_code:
-                    # Extract code from generic code blocks
-                    new_code = new_code.split("```")[1].strip()
+                for line in lines:
+                    line = line.rstrip()
+                    if line.startswith("def solution(x):"):
+                        started = True
+                        cleaned_lines = [line]  # Reset if we find another function def
+                    elif started and line:
+                        if not line[0].isspace() and "def" not in line:
+                            break  # Stop if we hit non-indented non-def line
+                        cleaned_lines.append(line)
                 
-                # Ensure the code starts with the function definition
-                if not new_code.startswith("def solution"):
-                    st.text("Invalid response format - missing function definition")
+                new_code = "\n".join(cleaned_lines)
+
+                if not new_code.startswith("def solution(x):"):
+                    st.text("⚠️ Candidate discarded – invalid function definition")
                     continue
 
+                # Validate the function
                 try:
-                    namespace = {}  # Create a fresh namespace for each candidate
-                    exec(new_code, {}, namespace)
-                    new_score = evaluate(namespace["solution"])
-                    candidates.append((new_code, new_score))
-                    st.text(f"Candidate score: {new_score}")
+                    ns = {}
+                    exec(new_code, {}, ns)
+                    if "solution" not in ns or not callable(ns["solution"]):
+                        st.text("⚠️ Candidate discarded – invalid function")
+                        continue
                 except Exception as e:
-                    st.text(f"Candidate failed to execute. Error: {str(e)}")
-                    st.code(new_code, language="python")  # Show the failing code
+                    st.text(f"⚠️ Candidate discarded – syntax error: {str(e)}")
+                    continue
 
-            # Keep the best
-            best_candidate = max(candidates, key=lambda x: x[1], default=(best_code, best_score))
-            if best_candidate[1] > best_score:
-                best_code, best_score = best_candidate
+                candidates.append(new_code)
 
-    st.success("🎉 Evolution Complete!")
-    st.markdown("### 🏆 Best Discovered Function:")
-    st.code(best_code, language="python")
-    st.write(f"**Final score:** {best_score}")
+            # Full evaluation in parallel
+            scored_candidates = []
+
+            with ThreadPoolExecutor() as pool:
+                future_to_code = {}
+                for code in candidates:
+                    ns = {}
+                    try:
+                        exec(code, {}, ns)
+                        fn = ns["solution"]
+                    except Exception:
+                        continue
+                    future = pool.submit(full_evaluate, fn)
+                    future_to_code[future] = code
+
+                for future in as_completed(future_to_code):
+                    code = future_to_code[future]
+                    try:
+                        score = future.result()
+                    except Exception:
+                        continue
+                    scored_candidates.append((code, score))
+                    st.text(f"Candidate score: {score}")
+
+            # Merge population + new candidates, keep best unique by score
+            for code, score in scored_candidates:
+                population.append((gen, score, code))
+                save_candidate(conn, gen, score, code, objective_hash)
+
+            # Sort & truncate population
+            population.sort(key=lambda t: t[1], reverse=True)
+            if len(population) > population_size:
+                population = population[:population_size]
+
+            best_gen_score = population[0][1]
+            st.write(f"**Best score after generation {gen}: {best_gen_score}**")
+
+    # Final best
+    best_overall = population[0]
+    st.success("🎉 Evolution complete")
+    st.markdown("### 🏆 Best discovered function")
+    st.code(best_overall[2], language="python")
+    st.write(f"**Final score:** {best_overall[1]}")
+
+    # Close DB connection
+    conn.close()
