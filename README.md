@@ -1,10 +1,10 @@
 # 🧬 Mini AlphaEvolve v0.5
 
-**Mini AlphaEvolve v0.4** is a lightweight, interactive code evolution system built in Python and Streamlit. It enables users to evolve Python functions toward an objective using a custom evaluation function and LLM-driven mutations. This project is heavily inspired by DeepMind’s [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve/), but scoped down to run locally, simply, and transparently.
+**Mini AlphaEvolve v0.4** is a lightweight, interactive code evolution system built in Python and Streamlit. It enables users to evolve Python functions toward an objective using a custom evaluation function and LLM-driven mutations. This project is heavily inspired by DeepMind’s [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/), but scoped down to run locally, simply, and transparently.
 
 ---
 
-## 🚀 What It Does
+## What It Does
 
 - Evolves Python functions (starting from a seed `solution(x)`) using LLM-generated mutations
 - Scores each function with a user-defined `evaluate()` function
@@ -14,7 +14,7 @@
 
 ---
 
-## 🧠 How It Relates to DeepMind’s AlphaEvolve
+## How It Relates to DeepMind’s AlphaEvolve
 
 | Feature | Mini AlphaEvolve (This Repo) | DeepMind AlphaEvolve |
 |--------|-------------------------------|-----------------------|
@@ -30,7 +30,7 @@
 
 ---
 
-## 🎯 Key Design Decisions
+## Key Design Decisions
 
 - **Objective hashing**: Candidates are grouped by the user-defined objective to ensure separation between experiments.
 - **Full-code rewrites only**: To keep things simple and clean, each LLM call is expected to output a full function, no diffs.
@@ -39,7 +39,7 @@
 
 ---
 
-## 🔍 Why Build This?
+## Why Build This?
 
 While DeepMind’s AlphaEvolve is cutting-edge, it is highly complex, GPU-intensive, and deeply integrated into Google's infrastructure. This project aims to democratize the core idea: **LLM-guided evolution using code as the medium**, but with:
 - Transparent internals
@@ -48,15 +48,15 @@ While DeepMind’s AlphaEvolve is cutting-edge, it is highly complex, GPU-intens
 
 ---
 
-## 🧪 Try It Out
+## Try It Out
 
 1. Clone the repo
-2. Run `streamlit run app.py`
+2. Run `streamlit run mini_alphaevolve.py`
 3. Enter your OpenAI key, define a scoring function, and click “Start Evolution”
 
 ---
 
-## 📦 Future Directions
+## Future Directions
 
 - Add diff-based evolution
 - Multi-objective scoring
@@ -65,4 +65,4 @@ While DeepMind’s AlphaEvolve is cutting-edge, it is highly complex, GPU-intens
 
 ---
 
-Inspired by [AlphaEvolve: A coding agent for scientific and algorithmic discovery](https://deepmind.google/discover/blog/alphaevolve/)
+Inspired by [AlphaEvolve: A coding agent for scientific and algorithmic discovery](https://storage.googleapis.com/deepmind-media/DeepMind.com/Blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/AlphaEvolve.pdf)
