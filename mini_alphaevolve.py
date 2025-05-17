@@ -8,6 +8,8 @@ import textwrap
 import random
 import json
 import hashlib
+import plotly.express as px
+import pandas as pd
 
 ################################################################################
 # Helper utilities
@@ -43,6 +45,13 @@ def get_objective_hash(objective: str) -> str:
     return hashlib.md5(objective.encode()).hexdigest()
 
 
+def code_hash(code: str) -> str:
+    """Generate a hash of the code for deduplication."""
+    # Normalize whitespace to avoid trivial duplicates
+    normalized = "\n".join(line.rstrip() for line in code.splitlines())
+    return hashlib.md5(normalized.encode()).hexdigest()
+
+
 def init_db(db_path: Path):
     conn = sqlite3.connect(db_path)
     with conn:
@@ -52,17 +61,21 @@ def init_db(db_path: Path):
                 gen INTEGER,
                 score REAL,
                 code TEXT,
-                objective_hash TEXT
+                objective_hash TEXT,
+                code_hash TEXT,
+                quick_score REAL
             )"""
         )
     return conn
 
 
-def save_candidate(conn, gen, score, code, objective_hash):
+def save_candidate(conn, gen, score, code, objective_hash, quick_score=None):
     with conn:
         conn.execute(
-            "INSERT INTO population (gen, score, code, objective_hash) VALUES (?, ?, ?, ?)",
-            (gen, score, code, objective_hash),
+            """INSERT INTO population 
+               (gen, score, code, objective_hash, code_hash, quick_score) 
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (gen, score, code, objective_hash, code_hash(code), quick_score),
         )
 
 
@@ -82,12 +95,13 @@ def reset_db_for_objective(conn, objective_hash):
     with conn:
         conn.execute("DELETE FROM population WHERE objective_hash = ?", (objective_hash,))
 
+
 ################################################################################
 # Streamlit UI
 ################################################################################
 
-st.set_page_config(page_title="Mini AlphaEvolve v0.4", layout="wide")
-st.title("🧬 Mini AlphaEvolve — v0.4 (shared state, objective-specific DB)")
+st.set_page_config(page_title="Mini AlphaEvolve v0.5", layout="wide")
+st.title("🧬 Mini AlphaEvolve — v0.5")
 
 # Initialize session state for API key if not present
 if "openai_api_key" not in st.session_state:
@@ -135,6 +149,31 @@ reset_db = st.checkbox("Reset evolution database for this objective",
                       value=objective_changed,
                       help="Clear previous results and start fresh")
 
+# View past candidates
+if st.checkbox("📜 Show previous candidates for this objective"):
+    db_path = Path("alphaevolve.sqlite")
+    if db_path.exists():
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT gen, score, code, quick_score 
+               FROM population 
+               WHERE objective_hash = ? 
+               ORDER BY score DESC""", 
+            (objective_hash,)
+        )
+        rows = cur.fetchall()
+        if rows:
+            for gen, score, code, quick_score in rows:
+                score_text = f"Score: {score:.2f}"
+                if quick_score is not None:
+                    score_text += f" (Quick: {quick_score:.2f})"
+                with st.expander(f"Gen {gen} — {score_text}"):
+                    st.code(code, language="python")
+        else:
+            st.info("No previous candidates found for this objective.")
+        conn.close()
+
 st.markdown("#### Quick evaluation (cheap, optional)")
 quick_eval_code = st.text_area(
     "Return a numeric score quickly; may raise on failure. Empty = skip.",
@@ -168,6 +207,14 @@ quick_eval_code = st.text_area(
         """
     ),
 )
+
+quick_score_threshold = None
+if quick_eval_code.strip():
+    quick_score_threshold = st.slider(
+        "Quick evaluation score threshold (skip if below)",
+        0.0, 10.0, 3.0,
+        help="Skip full evaluation for candidates scoring below this threshold"
+    )
 
 st.markdown("#### Full evaluation (expensive)")
 full_eval_code = st.text_area(
@@ -224,7 +271,7 @@ inspiration_k = col2.slider("Inspirations in prompt", 0, 5, 3)
 run = st.button("🚀 Start Evolution")
 
 ################################################################################
-# Evolution logic (v0.4)
+# Evolution logic (v0.5)
 ################################################################################
 
 def load_eval_functions():
@@ -266,6 +313,14 @@ if run:
         reset_db_for_objective(conn, objective_hash)
         st.success("🗑️ Database cleared for current objective")
 
+    # Track seen code hashes for deduplication
+    seen_hashes = set()
+    
+    # Load existing code hashes for this objective
+    cur = conn.cursor()
+    cur.execute("SELECT code_hash FROM population WHERE objective_hash = ?", (objective_hash,))
+    seen_hashes.update(row[0] for row in cur.fetchall())
+
     # Seed population with initial code
     population = []  # list of tuples (gen, score, code)
 
@@ -273,13 +328,28 @@ if run:
     ns = {}
     exec(initial_code, {}, ns)
     sol_fn = ns["solution"]
+    
+    # Quick evaluate if available
+    quick_score = None
+    if quick_evaluate:
+        try:
+            quick_score = quick_evaluate(sol_fn)
+        except Exception:
+            pass
+    
     base_score = full_evaluate(sol_fn)
     population.append((0, base_score, initial_code))
-    save_candidate(conn, 0, base_score, initial_code, objective_hash)
+    save_candidate(conn, 0, base_score, initial_code, objective_hash, quick_score)
+    
+    # Add initial code hash
+    seen_hashes.add(code_hash(initial_code))
 
     client = openai.OpenAI(api_key=api_key)
 
     st.subheader("🧬 Evolution Progress")
+    
+    # Setup progress tracking
+    progress_data = []
 
     for gen in range(1, num_generations + 1):
         st.markdown(f"### Generation {gen}")
@@ -347,6 +417,13 @@ if run:
                     st.text("⚠️ Candidate discarded – invalid function definition")
                     continue
 
+                # Check for duplicates
+                h = code_hash(new_code)
+                if h in seen_hashes:
+                    st.text("⚠️ Candidate discarded – duplicate solution")
+                    continue
+                seen_hashes.add(h)
+
                 # Validate the function
                 try:
                     ns = {}
@@ -370,24 +447,39 @@ if run:
                     try:
                         exec(code, {}, ns)
                         fn = ns["solution"]
+                        
+                        # Quick evaluate if available
+                        if quick_evaluate and quick_score_threshold is not None:
+                            try:
+                                q_score = quick_evaluate(fn)
+                                if q_score < quick_score_threshold:
+                                    st.text(f"⚠️ Candidate discarded – quick score too low: {q_score:.2f}")
+                                    continue
+                            except Exception:
+                                continue
+                        
                     except Exception:
                         continue
                     future = pool.submit(full_evaluate, fn)
-                    future_to_code[future] = code
+                    future_to_code[future] = (code, q_score if quick_evaluate else None)
 
                 for future in as_completed(future_to_code):
-                    code = future_to_code[future]
+                    code, quick_score = future_to_code[future]
                     try:
                         score = future.result()
                     except Exception:
                         continue
-                    scored_candidates.append((code, score))
-                    st.text(f"Candidate score: {score}")
+                    scored_candidates.append((code, score, quick_score))
+                    score_text = f"Score: {score:.2f}"
+                    if quick_score is not None:
+                        score_text += f" (Quick: {quick_score:.2f})"
+                    st.text(f"Candidate {score_text}")
 
             # Merge population + new candidates, keep best unique by score
-            for code, score in scored_candidates:
+            for code, score, quick_score in scored_candidates:
                 population.append((gen, score, code))
-                save_candidate(conn, gen, score, code, objective_hash)
+                save_candidate(conn, gen, score, code, objective_hash, quick_score)
+                progress_data.append({"Generation": gen, "Score": score})
 
             # Sort & truncate population
             population.sort(key=lambda t: t[1], reverse=True)
@@ -403,6 +495,17 @@ if run:
     st.markdown("### 🏆 Best discovered function")
     st.code(best_overall[2], language="python")
     st.write(f"**Final score:** {best_overall[1]}")
+
+    # Plot score progression
+    if progress_data:
+        st.subheader("📈 Score Progression")
+        progress_df = pd.DataFrame(progress_data)
+        fig = px.line(progress_df, 
+                     x="Generation", 
+                     y="Score",
+                     title="Evolution Progress",
+                     markers=True)
+        st.plotly_chart(fig, use_container_width=True)
 
     # Close DB connection
     conn.close()
