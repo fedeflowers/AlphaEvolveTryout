@@ -1,6 +1,6 @@
 # 🧬 Mini AlphaEvolve v0.5
 
-**Mini AlphaEvolve v0.4** is a lightweight, interactive code evolution system built in Python and Streamlit. It enables users to evolve Python functions toward an objective using a custom evaluation function and LLM-driven mutations. This project is heavily inspired by DeepMind’s [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/), but scoped down to run locally, simply, and transparently.
+**Mini AlphaEvolve v0.5** is a lightweight, interactive code evolution system built in Python and Streamlit. It enables users to evolve Python functions toward an objective using a custom evaluation function and LLM-driven mutations. This project is heavily inspired by DeepMind’s [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/), but scoped down to run locally, simply, and transparently.
 
 ---
 https://www.loom.com/share/b20a914aed884d51a55708b9b8475078?sid=942870ac-d2d1-47ed-9476-06f9e564f0af
